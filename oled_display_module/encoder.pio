@@ -1,0 +1,119 @@
+;
+; NovaDSP - rotary encoder quadrature decoder for one PIO state machine.
+;
+; The state machine samples both phase pins in a tight loop, indexes a jump
+; table with (previous state, current state) and keeps a signed count in Y,
+; publishing it to the RX FIFO every iteration. Nothing interrupts the CPU and
+; nothing can be missed between polls, which is what matters here: core 0 is
+; holding a 1333 us audio deadline and must not be asked to service a knob.
+;
+; The technique - a 16-entry computed-jump table at address 0 - is the standard
+; one, and is how pico-examples/pio/quadrature_encoder does it. This is an
+; independent implementation of it.
+;
+
+.program quadrature
+.origin 0                  ; the jump table is indexed by absolute address,
+                           ; so it has to start at instruction 0
+
+; ---- jump table, addresses 0..15 --------------------------------------
+;
+; index = (previous << 2) | current, where a state is (B << 1) | A, read from
+; IN_BASE (A) and IN_BASE+1 (B).
+;
+; One detent of a normal 20-detent encoder is one full cycle of the sequence
+; 00 -> 01 -> 11 -> 10 -> 00, so four counts. Swap A and B in the wiring, or
+; negate on the CPU side, to flip which way is positive.
+;
+; The four "impossible" entries are corner-to-corner jumps - both phases seen
+; to change between two samples. That means a transition was missed entirely,
+; and there is no way to tell which direction it went, so they count as no
+; movement rather than guessing.
+
+    jmp update       ; 0000   00 -> 00   no change
+    jmp increment    ; 0001   00 -> 01
+    jmp decrement    ; 0010   00 -> 10
+    jmp update       ; 0011   00 -> 11   impossible
+    jmp decrement    ; 0100   01 -> 00
+    jmp update       ; 0101   01 -> 01   no change
+    jmp update       ; 0110   01 -> 10   impossible
+    jmp increment    ; 0111   01 -> 11
+    jmp increment    ; 1000   10 -> 00
+    jmp update       ; 1001   10 -> 01   impossible
+    jmp update       ; 1010   10 -> 10   no change
+    jmp decrement    ; 1011   10 -> 11
+    jmp update       ; 1100   11 -> 00   impossible
+    jmp decrement    ; 1101   11 -> 01
+    jmp increment    ; 1110   11 -> 10
+    jmp update       ; 1111   11 -> 11   no change
+
+; ---- handlers ---------------------------------------------------------
+
+decrement:
+    jmp y--, update        ; JMP Y-- always decrements, but only branches when
+    jmp update             ; Y was non-zero - so catch the fall-through too
+
+increment:
+    mov y, ~y              ; PIO cannot increment. Decrementing the complement
+    jmp y--, incdone       ; does it: ~(~y - 1) == y + 1
+incdone:
+    mov y, ~y
+
+update:
+    mov osr, isr           ; OSR = (previous << 2) | current
+    out x, 2               ; X = current, which is the next pass's previous
+    mov isr, y
+    push noblock           ; publish the count; never stall on a full FIFO
+
+loop:
+    mov isr, null          ; MOV to ISR also resets the input shift counter
+    in x, 2                ; ISR = previous
+    in pins, 2             ; ISR = (previous << 2) | current
+    mov pc, isr            ; computed jump into the table
+
+% c-sdk {
+
+// pin_a is the A phase; B must be pin_a + 1, because IN reads them as one
+// consecutive field.
+//
+// The encoder module carries its own 10k pull-ups, so the internal ones stay
+// off rather than fighting them. What must NOT be touched is the input
+// hysteresis: the 100 nF debounce caps make the rising edge a ~1 ms ramp, and
+// the Schmitt trigger (on by default, and pio_gpio_init leaves it that way) is
+// the only reason that ramp does not produce a burst of spurious transitions.
+static inline void quadrature_program_init(PIO pio, uint sm, uint offset,
+                                           uint pin_a, float clkdiv)
+{
+    pio_gpio_init(pio, pin_a);
+    pio_gpio_init(pio, pin_a + 1u);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_a, 2, false);
+
+    pio_sm_config c = quadrature_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_a);
+    sm_config_set_in_shift(&c, false, false, 32);   // shift left, no autopush
+    sm_config_set_out_shift(&c, true, false, 32);   // shift right, no autopull
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Y is the count and is not cleared by pio_sm_init. Zero it before the
+    // program can touch it. (The C side also subtracts a baseline, so a warm
+    // restart cannot leave a bogus offset behind either.)
+    pio_sm_exec(pio, sm, pio_encode_set(pio_y, 0));
+
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+// The state machine pushes every iteration, so the FIFO is normally full of
+// values of varying staleness. Draining level+1 entries guarantees the last
+// one was pushed after the drain started.
+static inline int32_t quadrature_get_count(PIO pio, uint sm)
+{
+    uint32_t v = 0;
+    int n = (int)pio_sm_get_rx_fifo_level(pio, sm) + 1;
+    while (n-- > 0)
+        v = pio_sm_get_blocking(pio, sm);
+    return (int32_t)v;
+}
+
+%}

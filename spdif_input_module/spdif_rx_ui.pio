@@ -1,0 +1,246 @@
+; spdif_rx_ui.pio - S/PDIF front end that pushes one sample per UI.
+;
+; ---- what this replaces, and why ----------------------------------------
+;
+; `spdif_rx.pio` is one instruction: it oversamples the pin at 4 samples per
+; UI and pushes raw levels, and **all** decoding happens in C. That was the
+; right first cut - it kept the whole algorithm host-testable - and it was
+; measured on the board at **292 cycles per word against 768000 words a
+; second, which is 73 % of a 307.2 MHz core**. The average fits and the peak
+; does not. `SESSION.md` has the bring-up.
+;
+; This program does the only thing that makes the cost go away: it stops
+; pushing raw oversampling. It samples the pin **once per UI, phase-locked to
+; the incoming edges**, so a 32-bit word is 32 UI and the word rate drops from
+; 768000/s to 4 x Fs - 192000/s at 48 kHz, a quarter as many words - and each
+; of those words is then decoded with word-parallel bit arithmetic rather than
+; run by run.
+;
+; **One sample per UI is not a lossy shortcut.** Every transition in an
+; IEC 60958 stream lands on a UI boundary, so the level at the centre of each
+; UI is a complete description of the waveform: biphase data, all three
+; preambles and the violations that identify them all survive it exactly. The
+; proof is in SpdifRxUi.h - the eight UI of B, M and W are three distinct
+; patterns, and nothing else in the stream produces a 3 UI run.
+;
+; ---- the algorithm ------------------------------------------------------
+;
+; Everything below follows from two facts: transitions only ever occur on UI
+; boundaries, and a run is never longer than 3 UI.
+;
+;   * On every transition, **snap**: a UI boundary just happened, so wait half
+;     a UI and sample. That is the centre of the UI that just started.
+;   * Then poll for the next transition for one UI. If it comes, snap again.
+;     If a whole UI passes without one, sample again - the run is longer than
+;     1 UI and we have just reached the centre of its next UI.
+;
+; So the sample points are half a UI, one and a half UI, two and a half UI
+; after a transition, and the sequence is cut short by the next transition.
+; A 1 UI run yields one sample, a 2 UI run two, a 3 UI run three: **exactly one
+; sample per UI, always**, with the phase re-established at every edge and
+; free-running for at most three UI between them.
+;
+; That last property is what makes the divider forgiving. The decoder only has
+; to be right about *where the centre of a UI is*, and it only has to hold that
+; for three UI at a time.
+;
+; ---- the divider, and the rate window it buys ---------------------------
+;
+; The state machine runs at SPDIF_UI_CYCLES (32) cycles per UI at the nominal
+; rate. Write N for that and R for how many cycles a real UI actually takes.
+;
+; **The binding constraint is not where the samples land - it is where the poll
+; is not looking.** After a sample at cycle s the program spends three cycles
+; reaching its first poll and two leaving the loop, so the pin is watched over
+; [s+3, s+29] of every 32. An edge in the six cycles after that is not seen
+; until the next period has already emitted a sample, which puts two samples in
+; one UI and breaks the framing. So for a run of L UI, snapped at 0 with
+; samples at 16, 48, 80:
+;
+;     16 + 32(L-1)  <  L.R  <=  16 + 32(L-1) + 29
+;
+; L = 3 is the tightest - it is the run inside every preamble - and gives
+; **26.67 < R <= 36.33**, which is 0.83 N to 1.135 N. In rates, with the
+; divider set for Fnom, a source between **0.881 x Fnom and 1.170 x Fnom**
+; decodes.
+;
+; Swept rather than asserted: test_spdif_ui.cpp walks the ratio in 1 % steps
+; and the cliffs land at 0.88 and 1.18, which is the arithmetic above to the
+; step size. A source 5 % off its nominal rate is therefore nowhere near the
+; edge, and the scan below puts every supported rate on its own position so
+; that the whole window is margin rather than half of it being rate error.
+;
+; ---- jitter -------------------------------------------------------------
+;
+; **Measured clean to +-0.175 UI of edge jitter, breaking up at +-0.20**,
+; against the +-0.10 the oversampling decoder was measured clean to. Swept in
+; test_spdif_ui.cpp, and printed there rather than only asserted.
+;
+; It is not the 0.39 UI a static margin calculation gives, and the reason is
+; worth keeping: the sample is half a UI after a *jittered* edge and the run
+; ends on another *independently jittered* one, so at +-j UI of peak jitter the
+; two can differ by 2j. That halves the figure before anything else happens.
+;
+; ---- the cost, stated as what it is -------------------------------------
+;
+; **This program has not been on hardware.** What is verified is the program
+; itself, on the host: test_spdif_ui.cpp assembles this file with the SDK's own
+; pioasm and runs the resulting instruction words in a small state-machine
+; emulator, driven by the same IEC 60958 encoder the oversampling decoder is
+; tested with. That is a different claim from "it works on the board" and is
+; not offered as a substitute for one - but it is not the untestable PIO this
+; file's predecessor declined to write, either.
+;
+; ---- which PIO block ----------------------------------------------------
+;
+; **PIO2**, same as before. PIO0 carries the I2S and PIO1 the encoder, whose
+; quadrature program declares `.origin 0` and takes 29 of 32 instructions.
+; This program is 13 instructions and the S/PDIF transmitter is 1, so both
+; ends of the digital I/O still fit in PIO2 together.
+
+.program spdif_rx_ui
+
+; Sampling at the centre of a UI needs the sample to come half a UI after the
+; edge that started it. The two entry delays differ by one because the two
+; edge directions do not cost the same: a low-to-high edge is the `jmp pin`
+; being taken, a high-to-low edge is it falling through into a second jump.
+; SPDIF_UI_DELAY_HI and _LO in the header below carry the arithmetic.
+
+entry_lo:                        ; a falling edge just landed: level LOW
+    nop                 [12]            ; SPDIF_UI_DELAY_LO
+sample_lo:
+    in     pins, 1                      ; centre of this UI
+    set    x, 13        [1]             ; SPDIF_UI_POLL / SPDIF_UI_POLL_PAD
+poll_lo:
+    jmp    pin, entry_hi                ; went high - snap
+    jmp    x--, poll_lo
+    jmp    sample_lo                    ; a whole UI, no edge: sample again
+
+entry_hi:                               ; a rising edge just landed: level HIGH
+    nop                 [13]            ; SPDIF_UI_DELAY_HI
+sample_hi:
+    in     pins, 1
+    set    x, 13        [1]
+poll_hi:
+    jmp    pin, still_hi                ; still high - keep polling
+    jmp    entry_lo                     ; went low - snap
+still_hi:
+    jmp    x--, poll_hi
+    jmp    sample_hi
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// State machine cycles per UI. Everything in the program above is derived
+// from this one number and the two of them must not be edited apart:
+//
+//     free-run period   = 1 (in) + 1+PAD (set) + 2*(POLL+1) + 1 (jmp)
+//                       = 2*POLL + PAD + 5      == SPDIF_UI_CYCLES
+//
+// At 32 cycles with PAD 1 that is POLL 13, which is what `set x, 13` says.
+// A `set` immediate is five bits, so POLL may not exceed 31 and N may not
+// exceed 68.
+//
+// **32 rather than 16**: the poll loop is two cycles, so the phase snapped to
+// an edge is quantised to two cycles - 6 % of a UI at 32, 12 % at 16. It costs
+// nothing else. The upper bound is the state machine clock, and 32 cycles per
+// UI at 48 kHz is 196.6 MHz, which is clk_sys/1.5625 exactly.
+#define SPDIF_UI_CYCLES 32u
+#define SPDIF_UI_POLL   13u
+#define SPDIF_UI_PAD     1u
+
+// The two entry delays. A transition on the pin reaches the state machine two
+// cycles later through the pad synchroniser, is caught by the first poll at or
+// after that - so nought or one cycle of quantisation - and then:
+//
+//     low to high   jmp taken, then nop [DHI], then `in`   = 2 + DHI cycles
+//     high to low   jmp falls through into jmp entry_lo,
+//                   then nop [DLO], then `in`              = 3 + DLO cycles
+//
+// Both want to land SPDIF_UI_CYCLES/2 after the edge, so DHI = DLO + 1, and
+// DHI = N/2 - 3 puts the sample 15 or 16 cycles into a 32-cycle UI. Dead
+// centre, and the half-cycle of quantisation is the only asymmetry left.
+#define SPDIF_UI_DELAY_HI (SPDIF_UI_CYCLES / 2u - 3u)
+#define SPDIF_UI_DELAY_LO (SPDIF_UI_DELAY_HI - 1u)
+
+// The divider positions the module scans, **one per supported rate**, and the
+// same three RateEstimator classifies against.
+//
+// The window is wide enough that 44100 and 48000 would share a position at
+// their geometric mean - they are 8.8 % apart and the window is +12/-18 %.
+// They are given one each anyway, because the whole of that window is wanted
+// as jitter margin rather than half of it being spent on being on the wrong
+// divider: a source sitting on its own position has the full +-0.175 UI, and
+// one sharing a position measurably less.
+//
+// The cost is acquisition time, and it is small - a position is rejected in
+// the time it takes not to frame, which is one carrier timeout. A fourth rate
+// is a fourth entry and nothing else.
+#define SPDIF_UI_SCAN_HZ  { 48000u, 44100u, 32000u }
+#define SPDIF_UI_SCAN_N   3
+
+// The state machine clock a given nominal sample rate wants. One instruction
+// is one cycle, so this is simply UI rate x cycles per UI.
+//
+//     48000 Hz -> 48000 * 128 * 32 = 196.61 MHz  (clk_sys / 1.5625, exact)
+//     44100 Hz -> 44100 * 128 * 32 = 180.63 MHz  (clk_sys / 1.7007)
+//     32000 Hz -> 32000 * 128 * 32 = 131.07 MHz  (clk_sys / 2.34375, exact)
+//
+// All three are inside clk_sys, which is the only hard limit. The fractional
+// part of a divider adds up to one clk_sys cycle of period jitter - 0.6 state
+// machine cycles at the worst of those, 2 % of a UI - and the sampling is
+// re-snapped at every edge, so it never accumulates.
+static inline uint32_t spdif_rx_ui_sm_clock_hz(uint32_t nominal_fs_hz)
+{
+    return nominal_fs_hz * 128u * SPDIF_UI_CYCLES;
+}
+
+// Set the divider for a nominal rate. Separate from the init below because
+// **the module retunes a running state machine** as it scans: the program,
+// the pin and the FIFO plumbing do not change between scan positions, only
+// the clock does.
+static inline void spdif_rx_ui_set_rate(PIO pio, uint sm, uint32_t nominal_fs_hz)
+{
+    const uint32_t sys_hz = clock_get_hz(clk_sys);
+    const uint32_t sm_hz  = spdif_rx_ui_sm_clock_hz(nominal_fs_hz);
+
+    uint32_t div256 = (uint32_t)(((uint64_t)sys_hz * 256u) / sm_hz);
+    if (div256 < 256u) div256 = 256u;      // never faster than clk_sys
+
+    pio_sm_set_clkdiv_int_frac8(pio, sm, (uint16_t)(div256 >> 8),
+                                (uint8_t)(div256 & 0xFFu));
+}
+
+// Configure the sampler. `pin` is the S/PDIF input, claimed as an input with
+// the PIO function selected, and it is both the `in` source and the `jmp pin`
+// condition - the program samples and branches on the same pad.
+static inline void spdif_rx_ui_program_init(PIO pio, uint sm, uint offset,
+                                            uint pin, uint32_t nominal_fs_hz)
+{
+    pio_sm_config c = spdif_rx_ui_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+
+    // Shift **right**, so the first UI of a word ends up in bit 0 and the
+    // last in bit 31 - the same convention the oversampling front end used,
+    // and what SpdifRxUi walks from the LSB up.
+    //
+    // Autopush at 32 makes a word exactly 32 UI. A subframe is 64 UI, so it
+    // is two words; there is no arrangement that makes it one, because the
+    // FIFO is 32 bits wide and a subframe is 64 bit cells' worth of UI.
+    sm_config_set_in_shift(&c, true, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_gpio_init(pio, pin);
+
+    // **The pad synchroniser stays on.** It costs two cycles of latency on
+    // both the sample and the edge detection, which cancel - the decoder
+    // works in the synchronised copy of the waveform throughout - and it is
+    // what stops a slow optical edge being read as two transitions.
+
+    pio_sm_init(pio, sm, offset, &c);
+    spdif_rx_ui_set_rate(pio, sm, nominal_fs_hz);
+}
+%}

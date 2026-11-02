@@ -1,0 +1,138 @@
+; spdif_rx.pio - S/PDIF receiver front end for RP2350.
+;
+; ---- **this is no longer the shipped front end** -------------------------
+;
+; `spdif_rx_ui.pio` is, and this one is the reference implementation it is
+; tested against. `SPDIF_USE_PIO_DECODE` in asrc/SpdifInput.h picks between
+; them; 0 selects this one and it still builds, still runs and is still driven
+; by asrc/test_spdif.cpp's 31 checks.
+;
+; The argument below is preserved because it was right about everything except
+; its own premise, and the way it was wrong is the useful part:
+;
+;   * **The cost it was buying is real and was measured.** 292 cycles against
+;     each of 768000 words a second is 73 % of a 307.2 MHz core - the average
+;     fits inside the block deadline and the peak does not. The estimate this
+;     module was written against was ~30 %.
+;   * **"PIO cannot be tested on the host" turned out to be false.** A state
+;     machine is a 16-bit instruction word and five registers, and the subset a
+;     decoder needs is about a hundred lines to execute. asrc/PioSim.h is that
+;     emulator, and test_spdif_ui.cpp assembles the shipped .pio with the SDK's
+;     own pioasm and runs the instruction words that come out.
+;   * **The replacement did not need the decoder this file dreads writing.**
+;     The way out was not a run-length classifier in PIO - that really would
+;     have needed staged bounded waits and more than 32 instructions. It was to
+;     stop classifying runs at all and sample once per UI, which is 13
+;     instructions with no thresholds in it anywhere.
+;
+; ---- this program is one instruction, deliberately -----------------------
+;
+; It oversamples the input pin at a fixed rate and pushes raw levels. **All
+; decoding - run lengths, biphase-mark, preambles, framing, parity - happens
+; in C**, in SpdifRx.cpp.
+;
+; That is not the obvious split. The obvious one puts the BMC decode in PIO
+; and pushes one word per subframe, which is what every practical S/PDIF
+; receiver does and which costs about a fifth of the CPU this one does.
+; It was rejected for a reason that has nothing to do with elegance:
+;
+;   **PIO cannot be tested on the host, and this one can.**
+;
+; A run-length decoder in PIO needs a two-cycle measurement loop, a three-way
+; classification built out of staged bounded waits, a polarity-symmetric copy
+; of all of it, a BMC state machine and preamble matching - comfortably more
+; than the 32 instructions a PIO block has, and every line of it unverifiable
+; until the board is in front of you. This project has a file full of what
+; happens to arguments that were never measured.
+;
+; With the decode in C, the entire algorithm is driven by a synthetic IEC
+; 60958 encoder in test_spdif.cpp - including jitter, rate errors, corrupted
+; runs and carrier loss - and the only thing left that needs hardware is
+; whether `in pins, 1` samples the pin. There is not much to get wrong there.
+;
+; **If the measured CPU cost turns out too high**, the way out is to move the
+; run-length decode into PIO *afterwards*, with SpdifRx as the reference
+; implementation to test it against - exactly how the Leveller's float
+; conversion was done, and for the same reason.
+;
+; ---- the sample rate, and why one divider covers every input rate --------
+;
+; The divider is set for SPDIF_OVERSAMPLE samples per UI at 48 kHz. Because
+; the C side classifies run lengths against a **histogram it builds from the
+; signal** rather than against fixed thresholds, the same divider decodes
+; 44.1 and 32 kHz as well - their UI is simply longer, so their runs land on
+; larger sample counts and the thresholds follow.
+;
+;   sample rate = SPDIF_OVERSAMPLE * 128 * 48000 = 24.576 MHz at OVERSAMPLE 4
+;   clkdiv      = 307200000 / 24576000 = 12.5 exactly
+;
+;   input      UI          samples per UI at 24.576 MHz
+;   48000      162.8 ns    4.00
+;   44100      177.2 ns    4.36
+;   32000      244.1 ns    6.00
+;
+; The oversampling factor lives in SpdifRx.h, which is also where the measured
+; jitter margins for 2 and 4 are written down. Both the decoder and this
+; divider follow that one constant.
+;
+; ---- which PIO block ----------------------------------------------------
+;
+; **PIO2.** PIO0 carries the I2S and PIO1 the encoder, whose quadrature
+; program declares `.origin 0` and occupies 29 of 32 instructions - so PIO1 is
+; effectively full and PIO0's spare room is better left spare. RP2350 has a
+; third block and nothing else wants it.
+
+.program spdif_rx
+
+.wrap_target
+    in pins, 1
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// Configure the sampler. `pin` is the S/PDIF input; it is claimed as an input
+// with the PIO function selected.
+//
+// Shift direction is **right**, so the first sample of a word ends up in bit 0
+// and the last in bit 31. SpdifRx walks words from the LSB up and depends on
+// that ordering.
+//
+// No output pins, no side-set, no autopull - this state machine only ever
+// reads. Autopush at 32 keeps the CPU out of it entirely; a DMA channel drains
+// the RX FIFO into a ring.
+static inline void spdif_rx_program_init(PIO pio, uint sm, uint offset,
+                                         uint pin, uint32_t sample_rate_hz)
+{
+    pio_sm_config c = spdif_rx_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_in_shift(&c, true, true, 32);   // shift right, autopush, 32
+
+    // The whole FIFO is for RX - nothing here ever transmits.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // One instruction per sample, so the state machine clock *is* the sample
+    // rate. At the shipped 24.576 MHz this is exactly clk_sys/12.5.
+    const uint32_t sys_hz = clock_get_hz(clk_sys);
+    const uint32_t div256 = (uint32_t)(((uint64_t)sys_hz * 256u) / sample_rate_hz);
+    sm_config_set_clkdiv_int_frac8(&c, div256 >> 8, (uint8_t)(div256 & 0xFFu));
+
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_gpio_init(pio, pin);
+
+    // A receiver has nothing to say about how the pin is driven, but it does
+    // care that a slow edge is not read twice. The pad's Schmitt trigger is on
+    // by default on RP2350 and is left that way deliberately - see the
+    // encoder's RC note in SESSION-NOTES.md for the same argument.
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// The sample clock this build wants, given the oversampling factor. Kept here
+// so the divider and the decoder cannot disagree about it.
+static inline uint32_t spdif_rx_sample_rate_hz(uint32_t oversample)
+{
+    return oversample * 128u * 48000u;
+}
+%}

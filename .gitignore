@@ -1,0 +1,27 @@
+# Build directories. build.bat, make_firmware.bat and build-variants.bat all
+# write into the tree, and out:<dir> can name anything - so the pattern is by
+# prefix rather than a list.
+build/
+build-*/
+
+# Local toolchain overrides. pico-env.bat reads this if it exists; it is where
+# a machine-specific PICO_SDK_PATH or board goes, so it must never be tracked.
+pico-env.local.bat
+
+# Host-side test binaries. The S/PDIF modules' test_*.cpp are compiled and run
+# on the PC, not the board.
+*.exe
+*.obj
+*.o
+
+# The animation tool's inputs and output. main.go is the tool; the .mp4 source
+# recordings and the built binary are not part of the firmware.
+oled_vis/vid/
+oled_vis/animtool
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

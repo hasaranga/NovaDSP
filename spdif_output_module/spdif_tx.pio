@@ -1,0 +1,93 @@
+; spdif_tx.pio - S/PDIF transmitter front end for RP2350.
+;
+; ---- one instruction, and here it is not even a trade --------------------
+;
+; The receiver's program is one instruction because a run-length decoder in
+; PIO would not fit and could not be tested. This one is one instruction
+; because there is nothing else for it to do: SpdifTx has already turned the
+; audio into biphase, so the state machine's whole job is to shift bits out at
+; the unit-interval rate.
+;
+; ---- the divider is exact, and that is the whole story -------------------
+;
+; Transmitting, **this box is the master**. There is no source clock to track,
+; no drift, no lock state and no resampling - all the machinery in
+; spdif_input_module exists because a receiver has none of that freedom.
+;
+;   UI rate = 128 UI/frame * 48000 = 6.144 MHz
+;   clkdiv  = 307200000 / 6144000 = 50 exactly
+;
+; An integer divider means every edge lands on a clk_sys tick with no dither,
+; so the transmitted jitter is the crystal's and nothing else. That is the
+; same argument that put MCLK on CLK_GPOUT rather than a PIO pin - see
+; audio.h - and here it costs nothing to have.
+;
+; 44.1 kHz would need 54.42, which is fractional and would smear ~3.3 ns onto
+; every edge. It does not arise: the output side of this box is always 48 kHz
+; because that is what the whole firmware runs at.
+;
+; ---- which PIO block ----------------------------------------------------
+;
+; **PIO2**, alongside the receiver if one is fitted. PIO0 is the I2S and PIO1
+; the encoder, whose quadrature program declares `.origin 0` and takes 29 of
+; its 32 instructions. Two one-instruction programs and four state machines
+; leave PIO2 with room to spare, so an `input:spdif output:spdif` build fits
+; without anything moving.
+;
+; ---- the analogue side, which this cannot do ----------------------------
+;
+; A 3V3 logic pin is not an S/PDIF output. For **coax** the standard wants
+; 0.5 Vpp into 75 ohm, which is a divider and a blocking capacitor at least,
+; and a transformer if isolation matters. For **optical** a TOSLINK
+; transmitter module takes 3V3 logic directly and needs nothing else, which
+; is why optical is the easy way to bring this up.
+
+.program spdif_tx
+
+.wrap_target
+    out pins, 1
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// Configure the transmitter. `pin` is driven as an output.
+//
+// Shift direction is **right**, so bit 0 of a word is the first UI on the
+// wire. SpdifTx builds its words that way and the two must agree; getting it
+// backwards inverts every preamble and nothing downstream locks.
+static inline void spdif_tx_program_init(PIO pio, uint sm, uint offset,
+                                         uint pin, uint32_t ui_rate_hz)
+{
+    pio_sm_config c = spdif_tx_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_out_shift(&c, true, true, 32);   // shift right, autopull, 32
+
+    // The whole FIFO is for TX - nothing here ever receives.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // One instruction per UI, so the state machine clock *is* the UI rate.
+    // At 6.144 MHz this is exactly clk_sys/50.
+    const uint32_t sys_hz = clock_get_hz(clk_sys);
+    const uint32_t div256 = (uint32_t)(((uint64_t)sys_hz * 256u) / ui_rate_hz);
+    sm_config_set_clkdiv_int_frac8(&c, div256 >> 8, (uint8_t)(div256 & 0xFFu));
+
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_gpio_init(pio, pin);
+
+    // Slew rate is left at the SDK default deliberately. A faster edge is a
+    // cleaner eye at the receiver and a worse one for emissions, and on a
+    // 6.144 MHz signal leaving the board neither is obviously right without
+    // measuring. If a receiver ever fails to lock, this is a knob.
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// The UI rate this build transmits at. Kept here so the divider and the
+// encoder cannot disagree about it.
+static inline uint32_t spdif_tx_ui_rate_hz(void)
+{
+    return 128u * 48000u;
+}
+%}

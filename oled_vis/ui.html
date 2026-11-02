@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>animtool</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#14171a; color:#d6dde3;
+         font:13px/1.5 "Segoe UI",system-ui,sans-serif; }
+  header { padding:10px 14px; border-bottom:1px solid #2a3038;
+           display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input,button,select { background:#1e242b; color:#d6dde3; border:1px solid #2f3742;
+          border-radius:4px; padding:5px 9px; font:inherit; }
+  button { cursor:pointer; }
+  button:hover:not(:disabled) { background:#28303a; }
+  button:disabled { opacity:.35; cursor:default; }
+  button.go { background:#2f6b57; border-color:#3d8a6f; }
+  button.go:hover:not(:disabled) { background:#3a8069; }
+  #path { flex:1; min-width:280px; }
+
+  .steps { display:flex; gap:4px; padding:10px 14px 0; }
+  .step { padding:5px 12px; border-radius:4px 4px 0 0; color:#5a646d;
+          border:1px solid transparent; border-bottom:none; font-size:12px;
+          cursor:pointer; user-select:none; }
+  .step.on { background:#181c21; border-color:#2a3038; color:#5ec9a2; }
+  .step.dim { opacity:.4; cursor:default; }
+  .pane { display:none; padding:14px; }
+  .pane.on { display:block; }
+
+  .sidebar { float:right; width:300px; margin-left:16px; }
+  .panel { background:#181c21; border:1px solid #2a3038; border-radius:6px;
+           padding:12px; margin-bottom:12px; }
+  .panel h3 { margin:0 0 8px; font-size:12px; text-transform:uppercase;
+              letter-spacing:.08em; color:#7f8b96; font-weight:600; }
+  .row { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+  .row label { width:66px; color:#7f8b96; flex:none; }
+  .row input[type=number],.row input[type=text] { width:74px; }
+  .row input[type=range] { width:120px; padding:0; }
+  .row .v { width:40px; color:#5a646d; font-size:12px; text-align:right; }
+  .hint { color:#5a646d; font-size:12px; }
+  .ok { color:#5ec9a2; }
+  .err { color:#e2725b; }
+  .warn { color:#d1a24a; }
+  kbd { background:#252c34; border:1px solid #39424d; border-radius:3px;
+        padding:1px 5px; font-size:11px; }
+
+  /* ---- crop stage ---- */
+  #cropStage { position:relative; display:inline-block; line-height:0;
+               border:1px solid #2a3038; border-radius:6px; overflow:hidden; }
+  #scrubImg { display:block; max-width:100%; max-height:52vh; background:#000; }
+  #cropBox { position:absolute; border:1px solid #5ec9a2; cursor:move;
+             box-shadow:0 0 0 9999px rgba(0,0,0,.55); box-sizing:border-box; }
+  .hnd { position:absolute; width:14px; height:14px; background:#5ec9a2;
+         border-radius:2px; }
+  .hnd.nw{left:-7px;top:-7px;cursor:nwse-resize}
+  .hnd.ne{right:-7px;top:-7px;cursor:nesw-resize}
+  .hnd.sw{left:-7px;bottom:-7px;cursor:nesw-resize}
+  .hnd.se{right:-7px;bottom:-7px;cursor:nwse-resize}
+
+  /* ---- timeline ---- */
+  #timeline { margin-top:10px; }
+  #scrub { width:100%; }
+  .marks { position:relative; height:14px; background:#0c0e10;
+           border:1px solid #2a3038; border-radius:3px; overflow:hidden; }
+  #range { position:absolute; top:0; bottom:0; background:#2f6b57; opacity:.55; }
+  #cursor { position:absolute; top:0; bottom:0; width:2px; background:#5ec9a2; }
+
+  canvas { image-rendering:pixelated; display:block; background:#000; }
+  #cropPrev { margin:0 auto; border:1px solid #2a3038; }
+  #player { border:1px solid #2a3038; border-radius:4px; margin:0 auto; }
+
+  #strip { display:flex; flex-wrap:wrap; gap:4px; max-height:30vh;
+           overflow-y:auto; padding:8px; background:#0c0e10;
+           border:1px solid #2a3038; border-radius:6px; margin-top:12px; }
+  .cell { position:relative; line-height:0; border:2px solid transparent;
+          border-radius:3px; cursor:pointer; }
+  .cell img { image-rendering:pixelated; display:block; background:#000; }
+  .cell.sel { border-color:#5ec9a2; }
+  .cell .n { position:absolute; left:2px; bottom:0; font-size:9px; color:#cfe;
+             text-shadow:0 0 3px #000; line-height:1.3; }
+  .cell .x { position:absolute; right:0; top:0; display:none; cursor:pointer;
+             background:#e2725b; color:#14171a; font-size:11px; line-height:1;
+             padding:2px 4px; border-radius:0 2px 0 3px; }
+  .cell:hover .x { display:block; }
+
+  #msg { padding:0 14px 14px; color:#7f8b96; min-height:20px; }
+  pre { background:#0c0e10; border:1px solid #2a3038; border-radius:6px;
+        padding:10px; overflow-x:auto; font-size:12px; color:#9fb0bd; }
+</style>
+</head>
+<body>
+
+<header>
+  <input id="path" placeholder="Full path to video, e.g. C:\clips\eq.mp4">
+  <button id="openBtn" class="go">Open video</button>
+  <span id="status" class="hint"></span>
+</header>
+
+<div class="steps">
+  <div class="step on"  id="tab1">1 &middot; Source &amp; range</div>
+  <div class="step dim" id="tab2">2 &middot; Preview</div>
+  <div class="step dim" id="tab3">3 &middot; Export</div>
+</div>
+
+<!-- ============================ STEP 1 ============================ -->
+<div class="pane on" id="pane1">
+  <div class="sidebar">
+    <div class="panel">
+      <h3>Panel</h3>
+      <div class="row"><label>width</label><input id="ow" type="number" value="128" min="8" max="512"></div>
+      <div class="row"><label>height</label><input id="oh" type="number" value="64" min="8" max="512" step="8"></div>
+      <div class="row"><label>fit</label>
+        <select id="fit" style="width:120px">
+          <option value="cover">cover (fill, crop)</option>
+          <option value="contain">contain (letterbox)</option>
+        </select></div>
+      <div class="row"><label>lock ratio</label>
+        <input id="lock" type="checkbox" checked style="width:auto"></div>
+      <canvas id="cropPrev" width="128" height="64"></canvas>
+      <div class="hint" style="text-align:center;padding-top:6px">
+        crop at panel size with tone, 2&times;
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Range &amp; length</h3>
+      <div class="row"><label>from</label>
+        <input id="startT" type="number" value="0" min="0" step="0.04" disabled>
+        <span class="hint">s</span><span class="hint" id="startF">f0</span></div>
+      <div class="row"><label>to</label>
+        <input id="endT" type="number" value="0" min="0" step="0.04" disabled>
+        <span class="hint">s</span><span class="hint" id="endF">f0</span></div>
+      <div class="row" style="margin-top:8px"><label>fps</label>
+        <input id="fps" type="number" value="25" min="1" max="50" step="1">
+        <span class="hint" id="fpsInfo">40 ms/frame</span></div>
+      <div class="row"><label>duration</label>
+        <input id="dur" type="number" value="2" min="0.04" step="0.1"> <span class="hint">s</span></div>
+      <div class="row hint" id="lenInfo">-</div>
+      <div class="row"><button id="matchBtn">Match selected range</button></div>
+    </div>
+
+    <div class="panel">
+      <h3>Tone</h3>
+      <div class="row"><label>bright</label>
+        <input id="bright" type="range" min="-1" max="1" step="0.02" value="0">
+        <span class="v" id="brightV">0.00</span></div>
+      <div class="row"><label>contrast</label>
+        <input id="contrast" type="range" min="0" max="3" step="0.02" value="1.4">
+        <span class="v" id="contrastV">1.40</span></div>
+      <div class="row"><label>gamma</label>
+        <input id="gamma" type="range" min="0.2" max="3" step="0.02" value="1">
+        <span class="v" id="gammaV">1.00</span></div>
+      <div class="row"><label>sharpen</label>
+        <input id="sharpen" type="checkbox" checked style="width:auto"></div>
+      <div class="row"><button id="resetTone">Reset tone</button></div>
+      <div class="hint">Contrast above 1 usually helps: at one bit per pixel
+        only light-versus-dark survives.</div>
+    </div>
+
+    <button id="extractBtn" class="go" disabled style="width:100%">Extract frames</button>
+  </div>
+
+  <div id="cropStage">
+    <img id="scrubImg" src="" alt="">
+    <div id="cropBox">
+      <div class="hnd nw"></div><div class="hnd ne"></div>
+      <div class="hnd sw"></div><div class="hnd se"></div>
+    </div>
+  </div>
+
+  <div id="timeline">
+    <input id="scrub" type="range" min="0" max="0" value="0" disabled>
+    <div class="marks"><div id="range"></div><div id="cursor"></div></div>
+    <div class="row" style="margin-top:8px">
+      <button id="setStart">Set start</button>
+      <button id="setEnd">Set end</button>
+      <button id="wholeBtn">Whole clip</button>
+      <button id="fullBtn">Whole frame</button>
+      <span class="hint" id="rangeInfo">-</span>
+    </div>
+    <div class="hint">
+      <kbd>&larr;</kbd><kbd>&rarr;</kbd> step frame &nbsp;
+      <kbd>[</kbd> set start &nbsp; <kbd>]</kbd> set end
+    </div>
+  </div>
+</div>
+
+<!-- ============================ STEP 2 ============================ -->
+<div class="pane" id="pane2">
+  <div class="sidebar">
+    <div class="panel">
+      <h3>1-bit conversion</h3>
+      <div class="row"><label>mode</label>
+        <select id="mode" style="width:130px">
+          <option value="threshold">hard threshold</option>
+          <option value="bayer">ordered dither</option>
+          <option value="fs">Floyd-Steinberg</option>
+        </select></div>
+      <div class="row"><label>threshold</label>
+        <input id="th" type="range" min="1" max="254" value="128">
+        <span class="v" id="thV">128</span></div>
+      <div class="row"><label>invert</label>
+        <input id="invert" type="checkbox" style="width:auto"></div>
+      <div class="row hint" id="covInfo">-</div>
+      <div class="hint">Ordered dither holds still between frames.
+        Floyd-Steinberg is sharper but crawls when the picture moves.</div>
+    </div>
+    <div class="panel">
+      <h3>Playback</h3>
+      <div class="row"><label>zoom</label>
+        <input id="zoom" type="range" min="1" max="8" value="4">
+        <span class="v" id="zoomV">4&times;</span></div>
+      <div class="row">
+        <button id="playBtn">Pause</button>
+        <button id="prevBtn">&larr;</button>
+        <button id="nextBtn">&rarr;</button>
+      </div>
+      <div class="row"><input id="frameScrub" type="range" min="0" max="0" value="0" style="width:100%"></div>
+      <div class="row hint" id="playInfo">-</div>
+    </div>
+    <div class="panel">
+      <h3>Edit</h3>
+      <div class="row">
+        <button id="dropBtn">Remove frame</button>
+        <button id="restoreBtn" disabled>Restore all</button>
+      </div>
+      <div class="row hint" id="dropInfo">-</div>
+      <div class="hint">Takes the frame at the playhead out of the loop.
+        <kbd>Del</kbd> does the same, and stays put so a bad run goes in a few
+        presses. The greyscale is kept, so Restore all costs nothing.</div>
+    </div>
+    <button id="toExport" class="go" style="width:100%">Go to export</button>
+  </div>
+
+  <canvas id="player" width="128" height="64"></canvas>
+  <div id="strip"></div>
+</div>
+
+<!-- ============================ STEP 3 ============================ -->
+<div class="pane" id="pane3">
+  <div class="panel" style="max-width:640px">
+    <h3>Output</h3>
+    <div class="row"><label style="width:80px">folder</label>
+      <input id="outDir" type="text" value="." style="flex:1"></div>
+    <div class="row"><label style="width:80px">name</label>
+      <input id="outName" type="text" value="oled_anim" style="width:200px">
+      <span class="hint">gives name.h / name.c and <code>name_frames[]</code></span></div>
+    <div class="row"><label style="width:80px">layout</label>
+      <select id="layout" style="width:230px">
+        <option value="pages">page-packed (SH1106 / SSD1306 memcpy)</option>
+        <option value="rows">row-packed, MSB first (XBM order)</option>
+      </select></div>
+    <div class="row"><label style="width:80px">files</label>
+      <select id="split" style="width:230px">
+        <option value="pair">.h + .c pair</option>
+        <option value="header">header only (static array)</option>
+      </select></div>
+    <div class="row"><label style="width:80px">in flash</label>
+      <input id="inFlash" type="checkbox" checked style="width:auto">
+      <span class="hint">Pico <code>__in_flash()</code>, keeps it out of SRAM</span></div>
+    <div class="row" style="margin-top:10px">
+      <button id="exportBtn" class="go">Write header</button>
+      <span id="exportInfo" class="hint"></span>
+    </div>
+  </div>
+
+  <div class="panel" style="max-width:640px">
+    <h3>Playing it</h3>
+    <pre id="usage">-</pre>
+  </div>
+</div>
+
+<div id="msg"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const msg = (t, cls) => { $('msg').className = cls || 'hint'; $('msg').textContent = t || ''; };
+
+// Two frame rates live here and they are not the same thing.
+//   scrubFps - the fixed grid the proxy was decoded on. Everything to do with
+//              the source (the scrubber, the range, the from/to fields) counts
+//              in these frames, and it never changes.
+//   animFps  - what the exported animation plays at. The user's choice; it
+//              decides the frame count, the flash cost and the preview speed.
+let scrubFps = 25;
+// Bumped by the server on every open, and appended to the scrub-frame URLs.
+// Without it the browser answers /api/proxy?i=0 for the new video out of the
+// cache it filled for the old one, and the whole clip looks unchanged.
+let proxyGen = 0;
+const animFps = () => Math.max(1, Math.min(50, Math.round(+$('fps').value || 25)));
+
+let src = null;          // {srcW,srcH,frames,duration,fps,firstLit}
+let cur = 0;             // current proxy frame
+let selStart = 0, selEnd = 0;
+let crop = {x:0.2, y:0.2, w:0.6, h:0.3};
+let extracted = null;    // {frames,w,h}
+let rendered = null;     // {gen,frames,bytesPerFrame,total}
+let imgs = [];           // preloaded preview frames
+let playing = false, playIdx = 0, playTimer = null;
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || 'request failed');
+  return j;
+}
+
+/* ---------------------------------------------------------- tabs */
+function showTab(n) {
+  for (let i = 1; i <= 3; i++) {
+    $('tab'+i).classList.toggle('on', i === n);
+    $('pane'+i).classList.toggle('on', i === n);
+  }
+  if (n !== 2) stopPlay();
+  else if (imgs.length) startPlay();
+}
+$('tab1').onclick = () => showTab(1);
+$('tab2').onclick = () => { if (!$('tab2').classList.contains('dim')) showTab(2); };
+$('tab3').onclick = () => { if (!$('tab3').classList.contains('dim')) showTab(3); };
+
+// Forget the current extraction: stop the playback timer, drop the frame
+// images, empty the strip and lock the two tabs that only mean anything once
+// frames exist. Called when a new video is opened, so nothing from the last
+// one is left on screen claiming to be current.
+function clearExtraction() {
+  stopPlay();
+  extracted = rendered = null;
+  imgs = [];
+  playIdx = 0;
+  $('strip').innerHTML = '';
+  $('frameScrub').max = 0;
+  $('frameScrub').value = 0;
+  $('covInfo').textContent = '-';
+  $('playInfo').textContent = '-';
+  $('dropInfo').textContent = '-';
+  $('exportInfo').textContent = '';
+  $('usage').textContent = '-';
+  $('restoreBtn').disabled = true;
+  $('tab2').classList.add('dim');
+  $('tab3').classList.add('dim');
+  const cv = $('player'), g = cv.getContext('2d');
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, cv.width, cv.height);
+  showTab(1);
+}
+
+/* ------------------------------------------------------- step 1 */
+$('openBtn').onclick = async () => {
+  const p = $('path').value.trim();
+  if (!p) { msg('Paste the full path to a video first.', 'err'); return; }
+  msg('Decoding to a 25 fps proxy - this takes a moment for a long clip...');
+  $('openBtn').disabled = true;
+  try {
+    src = await post('/api/open', {path: p});
+    scrubFps = src.fps;
+    proxyGen = src.gen;
+    // The server has already dropped the old extraction, so the preview and
+    // export tabs are now describing frames that no longer exist. Put the
+    // client back to the same state.
+    clearExtraction();
+    // Open on the first frame that has a picture on it, not on frame 0. Clips
+    // routinely start black or fade in, and a black frame tells you nothing
+    // about where to put the crop box or where the tone controls should sit.
+    selStart = src.firstLit; selEnd = src.frames - 1;
+    $('scrub').max = src.frames - 1;
+    $('scrub').disabled = false;
+    $('startT').disabled = $('endT').disabled = false;
+    $('startT').max = $('endT').max = ((src.frames - 1) / scrubFps).toFixed(2);
+    $('extractBtn').disabled = false;
+    $('status').textContent =
+      `${src.srcW}\u00d7${src.srcH}, ${src.frames} frames, ${src.duration.toFixed(2)} s`;
+    gotoFrame(selStart);
+    fitCrop();
+    msg(src.firstLit > 0
+      ? `Opened at frame ${src.firstLit} (${(src.firstLit/scrubFps).toFixed(2)} s) - the first`
+        + ' frame that is not black. Type a range, or scrub and press [ and ] .'
+      : 'Type a range, or scrub and press [ and ] .');
+  } catch (e) { msg(e.message, 'err'); }
+  $('openBtn').disabled = false;
+};
+$('path').onkeydown = e => { if (e.key === 'Enter') $('openBtn').click(); };
+
+function gotoFrame(i) {
+  if (!src) return;
+  cur = Math.max(0, Math.min(src.frames - 1, i));
+  $('scrub').value = cur;
+  $('scrubImg').src = `/api/proxy?i=${cur}&g=${proxyGen}`;
+  drawMarks();
+}
+$('scrub').oninput = e => gotoFrame(+e.target.value);
+
+function drawMarks() {
+  if (!src) return;
+  const n = src.frames - 1 || 1;
+  $('range').style.left  = (selStart / n * 100) + '%';
+  $('range').style.width = ((selEnd - selStart) / n * 100) + '%';
+  $('cursor').style.left = (cur / n * 100) + '%';
+  const span = selEnd - selStart + 1;
+  $('rangeInfo').textContent =
+    `frame ${cur} \u00b7 ${(cur/scrubFps).toFixed(2)} s   |   range ${selStart}\u2013${selEnd}` +
+    ` (${span} frames, ${(span/scrubFps).toFixed(2)} s)`;
+  syncRange();
+  updateLen();
+}
+
+// The range lives in one place - selStart/selEnd, in frames - and both the
+// scrubber and the two time fields are views onto it. The field being typed in
+// is normally left alone, or it would fight the user halfway through a number;
+// `force` overrides that for the handlers that fire once the edit is finished
+// and the value should be snapped to the frame grid.
+function syncRange(force) {
+  if (force || document.activeElement !== $('startT'))
+    $('startT').value = (selStart/scrubFps).toFixed(2);
+  if (force || document.activeElement !== $('endT'))
+    $('endT').value = (selEnd/scrubFps).toFixed(2);
+  $('startF').textContent = 'f' + selStart;
+  $('endF').textContent   = 'f' + selEnd;
+}
+
+function clampFrame(f) {
+  return Math.max(0, Math.min(src ? src.frames - 1 : 0, f));
+}
+
+// Typing a time jumps the scrubber there too, so you see the frame you just
+// asked for rather than having to go and find it.
+$('startT').oninput = () => {
+  if (!src) return;
+  selStart = clampFrame(Math.round(parseFloat($('startT').value || '0') * scrubFps));
+  if (selEnd < selStart) selEnd = selStart;
+  gotoFrame(selStart);
+};
+$('endT').oninput = () => {
+  if (!src) return;
+  selEnd = clampFrame(Math.round(parseFloat($('endT').value || '0') * scrubFps));
+  if (selStart > selEnd) selStart = selEnd;
+  gotoFrame(selEnd);
+};
+// Tidy a half-typed number up once the field is done with. Both events,
+// because change fires on Enter and blur fires on clicking away.
+const snapRange = () => syncRange(true);
+$('startT').onblur = $('endT').onblur = snapRange;
+$('startT').onchange = $('endT').onchange = snapRange;
+
+$('setStart').onclick = () => { selStart = cur; if (selEnd < selStart) selEnd = selStart; drawMarks(); };
+$('setEnd').onclick   = () => { selEnd = cur; if (selStart > selEnd) selStart = selEnd; drawMarks(); };
+$('wholeBtn').onclick = () => { if (!src) return; selStart = 0; selEnd = src.frames - 1; drawMarks(); };
+$('matchBtn').onclick = () => { $('dur').value = ((selEnd - selStart + 1) / scrubFps).toFixed(2); updateLen(); };
+
+function frameCount() {
+  const n = Math.round(parseFloat($('dur').value || '0') * animFps());
+  return Math.max(1, Math.min(2000, n));
+}
+function updateLen() {
+  const n = frameCount(), f = animFps();
+  const bytes = n * (+$('ow').value) * (+$('oh').value) / 8;
+  let t = `${n} frames \u00b7 ${(n/f).toFixed(2)} s \u00b7 ${(bytes/1024).toFixed(1)} KB of flash`;
+  // Frames repeat when the duration asks for more of them than the selected
+  // range holds - which is about the source, so it is counted in scrub frames.
+  if (src && n > (selEnd - selStart + 1))
+    t += ' \u2014 longer than the range, frames will repeat';
+  $('lenInfo').textContent = t;
+  const ms = 1000 / f;
+  $('fpsInfo').textContent =
+    `${Number.isInteger(ms) ? ms : ms.toFixed(2)} ms/frame`;
+}
+['dur','fps','ow','oh'].forEach(id =>
+  $(id).oninput = () => { updateLen(); if (id === 'ow' || id === 'oh') fitCrop(); });
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if ($('pane1').classList.contains('on') && src) {
+    if (e.key === 'ArrowLeft')  { gotoFrame(cur - (e.shiftKey ? 25 : 1)); e.preventDefault(); }
+    if (e.key === 'ArrowRight') { gotoFrame(cur + (e.shiftKey ? 25 : 1)); e.preventDefault(); }
+    if (e.key === '[') $('setStart').click();
+    if (e.key === ']') $('setEnd').click();
+  }
+  if ($('pane2').classList.contains('on') && imgs.length) {
+    if (e.key === ' ') { $('playBtn').click(); e.preventDefault(); }
+    if (e.key === 'ArrowLeft')  { $('prevBtn').click(); e.preventDefault(); }
+    if (e.key === 'ArrowRight') { $('nextBtn').click(); e.preventDefault(); }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      dropFrame(playIdx); e.preventDefault();
+    }
+  }
+});
+
+/* ---- crop box ---- */
+const stage = $('cropStage'), box = $('cropBox'), simg = $('scrubImg');
+
+function outAspect() { return (+$('ow').value) / (+$('oh').value); }
+
+// Keep the box the panel's shape. The box is stored as fractions of the frame,
+// so the height fraction that makes a 2:1 *pixel* rectangle depends on how
+// tall the source frame is.
+function lockH(wFrac) {
+  if (!src) return wFrac;
+  return wFrac * (src.srcW / src.srcH) / outAspect();
+}
+function fitCrop() {
+  if (!src) return;
+  if ($('lock').checked) {
+    crop.h = lockH(crop.w);
+    if (crop.h > 1) { crop.h = 1; crop.w = crop.h * outAspect() * (src.srcH / src.srcW); }
+    if (crop.y + crop.h > 1) crop.y = Math.max(0, 1 - crop.h);
+  }
+  layoutBox();
+}
+$('lock').onchange = fitCrop;
+$('fit').onchange = drawCropPrev;
+$('fullBtn').onclick = () => {
+  crop = {x:0, y:0, w:1, h:1};
+  if ($('lock').checked) { $('lock').checked = false; }
+  layoutBox();
+};
+
+function layoutBox() {
+  const w = simg.clientWidth, h = simg.clientHeight;
+  if (!w) return;
+  box.style.left   = (crop.x * w) + 'px';
+  box.style.top    = (crop.y * h) + 'px';
+  box.style.width  = (crop.w * w) + 'px';
+  box.style.height = (crop.h * h) + 'px';
+  drawCropPrev();
+}
+simg.onload = () => { layoutBox(); drawCropPrev(); };
+window.addEventListener('resize', layoutBox);
+
+let drag = null;
+box.addEventListener('pointerdown', e => {
+  const hnd = e.target.classList.contains('hnd') ? e.target.classList[1] : 'move';
+  drag = {hnd, x:e.clientX, y:e.clientY, c:{...crop}};
+  // Capture keeps the drag alive when the pointer leaves the box, which it
+  // always does on a shrink. Synthetic events have no real pointer to capture.
+  try { box.setPointerCapture(e.pointerId); } catch (_) {}
+  e.preventDefault();
+});
+box.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const w = simg.clientWidth, h = simg.clientHeight;
+  const dx = (e.clientX - drag.x) / w, dy = (e.clientY - drag.y) / h;
+  const c = {...drag.c};
+  if (drag.hnd === 'move') {
+    c.x = Math.max(0, Math.min(1 - c.w, c.x + dx));
+    c.y = Math.max(0, Math.min(1 - c.h, c.y + dy));
+  } else {
+    const east = drag.hnd === 'ne' || drag.hnd === 'se';
+    const south = drag.hnd === 'se' || drag.hnd === 'sw';
+    let nw = east ? c.w + dx : c.w - dx;
+    nw = Math.max(0.02, Math.min(1, nw));
+    let nx = east ? c.x : c.x + (c.w - nw);
+    let nh = $('lock').checked ? lockH(nw) : (south ? c.h + dy : c.h - dy);
+    nh = Math.max(0.02, Math.min(1, nh));
+    if ($('lock').checked) nw = c.w + (east ? dx : -dx);
+    let ny = south ? c.y : c.y + (c.h - nh);
+    if (nx < 0) { nw += nx; nx = 0; }
+    if (ny < 0) { nh += ny; ny = 0; }
+    if (nx + nw > 1) nw = 1 - nx;
+    if (ny + nh > 1) nh = 1 - ny;
+    if ($('lock').checked) { nh = lockH(nw); if (ny + nh > 1) { nh = 1 - ny; nw = nh / lockH(1); } }
+    c.x = nx; c.y = ny; c.w = Math.max(0.02, nw); c.h = Math.max(0.02, nh);
+  }
+  crop = c;
+  layoutBox();
+});
+box.addEventListener('pointerup', () => { drag = null; });
+
+// A live look at the crop at real panel size. Greyscale only - the 1-bit
+// conversion happens on the server, on the real extracted pixels.
+function drawCropPrev() {
+  const cw = +$('ow').value, ch = +$('oh').value;
+  const cv = $('cropPrev');
+  cv.width = cw; cv.height = ch;
+  cv.style.width = (cw * 2) + 'px'; cv.style.height = (ch * 2) + 'px';
+  const g = cv.getContext('2d');
+  g.imageSmoothingEnabled = true;
+  g.fillStyle = '#000'; g.fillRect(0, 0, cw, ch);
+  if (!simg.naturalWidth) return;
+  let sx = crop.x * simg.naturalWidth, sy = crop.y * simg.naturalHeight;
+  let sw = crop.w * simg.naturalWidth, sh = crop.h * simg.naturalHeight;
+  if ($('fit').value === 'cover') {
+    // Trim the crop to the panel's shape, the same way the ffmpeg chain does.
+    const want = cw / ch, have = sw / sh;
+    if (have > want) { const n = sh * want; sx += (sw - n) / 2; sw = n; }
+    else             { const n = sw / want; sy += (sh - n) / 2; sh = n; }
+    g.drawImage(simg, sx, sy, sw, sh, 0, 0, cw, ch);
+  } else {
+    const s = Math.min(cw / sw, ch / sh);
+    const dw = sw * s, dh = sh * s;
+    g.drawImage(simg, sx, sy, sw, sh, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+  }
+  // BT.601 luma then the tone curve - the same order the filter chain uses,
+  // where format=gray takes the luma plane and eq has already worked on it.
+  const lut = toneLUT();
+  const d = g.getImageData(0, 0, cw, ch);
+  for (let i = 0; i < d.data.length; i += 4) {
+    const v = lut[(d.data[i]*77 + d.data[i+1]*150 + d.data[i+2]*29) >> 8];
+    d.data[i] = d.data[i+1] = d.data[i+2] = v;
+  }
+  g.putImageData(d, 0, 0);
+}
+
+// A transcription of ffmpeg's eq filter (vf_eq.c) so this preview answers the
+// tone sliders the way the extraction will. Without it the sliders appear to
+// do nothing until you extract, which is the one place a wrong guess costs a
+// re-run.
+//
+// eq picks between three code paths in check_values(), so this has to as well:
+// gamma alone would not tell you that the default gamma of 1 sends the whole
+// thing down an integer path with quite different rounding.
+//
+// Accuracy, measured against ffmpeg on a 0..255 ramp across the sliders'
+// range: contrast and gamma come out bit-exact everywhere. Brightness is exact
+// at most settings and up to 3/255 out at the rest, because eq's integer path
+// truncates a float product whose last bit depends on how ffmpeg itself was
+// compiled. That is under half a percent, on a thumbnail, and the step 2
+// preview is the bit-exact one - so it is not worth chasing.
+//
+// Sharpen is not modelled: it is a spatial filter, not a curve, and its effect
+// at this size is too small to guess at from a scaled proxy.
+function toneLUT() {
+  const b = +$('bright').value;
+  const c = +$('contrast').value;
+  const gm = +$('gamma').value;
+  const lut = new Uint8Array(256);
+
+  // Identity. ffmpeg would skip the filter entirely here, and so does the
+  // extraction - it only adds eq to the chain when something is off-default.
+  if (b === 0 && c === 1 && gm === 1) {
+    for (let i = 0; i < 256; i++) lut[i] = i;
+    return lut;
+  }
+
+  // Gamma 1 takes eq's integer path (process_c), not the float curve. That is
+  // the default, so it is the common case, and its fixed-point rounding sits
+  // up to two steps away from the float result. Math.trunc stands in for C's
+  // truncating int cast and integer division.
+  if (gm === 1 && Math.abs(c) <= 7) {
+    const con = Math.trunc(c * 256 * 16);
+    const bri = Math.trunc(Math.trunc(100 * b + 100) * 511 / 200)
+                - 128 - Math.trunc(con / 32);
+    for (let i = 0; i < 256; i++)
+      lut[i] = Math.max(0, Math.min(255, ((i * con) >> 12) + bri));
+    return lut;
+  }
+
+  // Everything else goes through create_lut's float curve.
+  const g = 1 / Math.max(0.1, Math.min(10, gm));
+  for (let i = 0; i < 256; i++) {
+    let v = c * (i/255 - 0.5) + 0.5 + b;
+    if (v <= 0) { lut[i] = 0; continue; }
+    v = Math.pow(v, g);
+    lut[i] = v >= 1 ? 255 : Math.floor(256 * v);
+  }
+  return lut;
+}
+
+['bright','contrast','gamma'].forEach(id => {
+  $(id).oninput = e => {
+    $(id+'V').textContent = (+e.target.value).toFixed(2);
+    drawCropPrev();
+  };
+});
+$('resetTone').onclick = () => {
+  $('bright').value = 0;    $('brightV').textContent = '0.00';
+  $('contrast').value = 1.4; $('contrastV').textContent = '1.40';
+  $('gamma').value = 1;     $('gammaV').textContent = '1.00';
+  drawCropPrev();
+};
+
+$('extractBtn').onclick = async () => {
+  if (!src) return;
+  msg('Extracting...');
+  $('extractBtn').disabled = true;
+  try {
+    extracted = await post('/api/extract', {
+      crop, w:+$('ow').value, h:+$('oh').value,
+      start:selStart, end:selEnd, count:frameCount(), fps:animFps(),
+      sharpen:$('sharpen').checked, fit:$('fit').value,
+      brightness:+$('bright').value, contrast:+$('contrast').value,
+      gamma:+$('gamma').value,
+    });
+    $('tab2').classList.remove('dim');
+    $('tab3').classList.remove('dim');
+    await render();
+    showTab(2);
+    msg(`${extracted.frames} frames from ${extracted.source} source frames,` +
+        ` crop ${extracted.crop} → ${extracted.w}×${extracted.h} @ ${extracted.fps} fps` +
+        (extracted.stretched ? ' - some are repeats, the range is shorter than the duration' : ''),
+        extracted.stretched ? 'warn' : 'ok');
+  } catch (e) { msg(e.message, 'err'); }
+  $('extractBtn').disabled = false;
+};
+
+/* ------------------------------------------------------- step 2 */
+$('th').oninput = e => { $('thV').textContent = e.target.value; scheduleRender(); };
+$('mode').onchange = render;
+$('invert').onchange = render;
+$('zoom').oninput = e => { $('zoomV').textContent = e.target.value + '\u00d7'; sizePlayer(); };
+
+let renderTimer = null;
+function scheduleRender() {
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(render, 120); // one render per pause, not per pixel
+}
+
+async function render() {
+  if (!extracted) return;
+  try {
+    rendered = await post('/api/render', {
+      mode:$('mode').value, threshold:+$('th').value, invert:$('invert').checked});
+    const pct = (rendered.coverage * 100);
+    let note = `${pct.toFixed(1)}% of pixels lit \u00b7 ${rendered.bytesPerFrame} B/frame` +
+               ` \u00b7 ${(rendered.total/1024).toFixed(1)} KB total`;
+    $('covInfo').className = 'row hint';
+    if (pct < 4)       { note += ' \u2014 too dark, drop the threshold'; $('covInfo').className = 'row warn'; }
+    else if (pct > 60) { note += ' \u2014 washed out, raise the threshold'; $('covInfo').className = 'row warn'; }
+    $('covInfo').textContent = note;
+    updateDropInfo();
+    await loadFrames();
+    buildStrip();
+    updateUsage();
+  } catch (e) { msg(e.message, 'err'); }
+}
+
+function updateDropInfo() {
+  if (!rendered) return;
+  const d = rendered.dropped || 0;
+  $('restoreBtn').disabled = d === 0;
+  $('dropInfo').className = d ? 'row warn' : 'row hint';
+  $('dropInfo').textContent = d
+    ? `${rendered.frames} of ${rendered.extracted} frames · ${d} removed` +
+      ` · loop now ${(rendered.frames/playFps()).toFixed(2)} s`
+    : `${rendered.frames} frames, none removed`;
+}
+
+// Removing keeps the playhead where it is, so it lands on the frame that
+// followed - hold Del and a bad run disappears without re-aiming each time.
+async function dropFrame(i) {
+  if (!rendered || i < 0 || i >= imgs.length) return;
+  const wasPlaying = playing;
+  stopPlay();
+  try {
+    await post('/api/frames', {drop: [i]});
+    playIdx = i;
+    await render();
+    if (playIdx >= imgs.length) playIdx = Math.max(0, imgs.length - 1);
+    drawPlayer();
+    if (wasPlaying) startPlay();
+  } catch (e) { msg(e.message, 'err'); }
+}
+
+$('dropBtn').onclick = () => dropFrame(playIdx);
+$('restoreBtn').onclick = async () => {
+  const wasPlaying = playing;
+  stopPlay();
+  try {
+    await post('/api/frames', {reset: true});
+    await render();
+    drawPlayer();
+    if (wasPlaying) startPlay();
+    msg('All extracted frames are back in the loop.', 'ok');
+  } catch (e) { msg(e.message, 'err'); }
+};
+
+function loadFrames() {
+  imgs = [];
+  const n = rendered.frames, g = rendered.gen;
+  // Re-rendering must not decide whether the animation is playing. If it did,
+  // nudging the threshold or removing a frame would restart playback and take
+  // the playhead with it - which makes stepping through frames to weed out the
+  // bad ones impossible. Switching to the preview tab is what starts playback.
+  const wasPlaying = playing;
+  return new Promise(res => {
+    let left = n;
+    for (let i = 0; i < n; i++) {
+      const im = new Image();
+      im.onload = im.onerror = () => { if (--left === 0) res(); };
+      im.src = `/api/frame?i=${i}&g=${g}`;
+      imgs.push(im);
+    }
+    if (!n) res();
+  }).then(() => {
+    $('frameScrub').max = Math.max(0, n - 1);
+    if (playIdx >= n) playIdx = Math.max(0, n - 1);
+    sizePlayer();
+    if (wasPlaying) startPlay();
+    else drawPlayer();
+  });
+}
+
+function sizePlayer() {
+  const z = +$('zoom').value, cv = $('player');
+  cv.width = extracted.w; cv.height = extracted.h;
+  cv.style.width = (extracted.w * z) + 'px';
+  cv.style.height = (extracted.h * z) + 'px';
+  drawPlayer();
+}
+
+function drawPlayer() {
+  const cv = $('player'), g = cv.getContext('2d');
+  g.imageSmoothingEnabled = false;
+  g.fillStyle = '#000'; g.fillRect(0, 0, cv.width, cv.height);
+  if (imgs[playIdx] && imgs[playIdx].complete) g.drawImage(imgs[playIdx], 0, 0);
+  $('frameScrub').value = playIdx;
+  $('playInfo').textContent =
+    `frame ${playIdx + 1} / ${imgs.length} \u00b7 ` +
+    `${(imgs.length/playFps()).toFixed(2)} s loop @ ${playFps()} fps`;
+  document.querySelectorAll('#strip .cell').forEach((c, i) =>
+    c.classList.toggle('sel', i === playIdx));
+}
+
+// The preview plays at the rate the loaded frames were extracted for, not at
+// whatever the fps field says right now - the field can be changed without
+// re-extracting, and the frames on screen are still the old set until it is.
+const playFps = () => (extracted ? extracted.fps : 25);
+
+function startPlay() {
+  stopPlay();
+  if (!imgs.length) return;
+  playing = true;
+  $('playBtn').textContent = 'Pause';
+  playTimer = setInterval(() => {
+    playIdx = (playIdx + 1) % imgs.length;
+    drawPlayer();
+  }, 1000 / playFps());
+}
+function stopPlay() {
+  playing = false;
+  $('playBtn').textContent = 'Play';
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+}
+$('playBtn').onclick = () => playing ? stopPlay() : startPlay();
+$('prevBtn').onclick = () => { stopPlay(); playIdx = (playIdx + imgs.length - 1) % imgs.length; drawPlayer(); };
+$('nextBtn').onclick = () => { stopPlay(); playIdx = (playIdx + 1) % imgs.length; drawPlayer(); };
+$('frameScrub').oninput = e => { stopPlay(); playIdx = +e.target.value; drawPlayer(); };
+
+function buildStrip() {
+  const s = $('strip');
+  s.innerHTML = '';
+  imgs.forEach((im, i) => {
+    const d = document.createElement('div');
+    d.className = 'cell';
+    const c = im.cloneNode();
+    c.style.width = (extracted.w) + 'px';
+    c.style.height = (extracted.h) + 'px';
+    d.appendChild(c);
+    const n = document.createElement('span');
+    n.className = 'n'; n.textContent = i;
+    d.appendChild(n);
+    // A remove button on the thumbnail itself, so a frame spotted while
+    // scanning the strip can go without first making it the playhead.
+    const x = document.createElement('span');
+    x.className = 'x'; x.textContent = '×'; x.title = 'remove this frame';
+    x.onclick = ev => { ev.stopPropagation(); dropFrame(i); };
+    d.appendChild(x);
+    d.onclick = () => { stopPlay(); playIdx = i; drawPlayer(); };
+    s.appendChild(d);
+  });
+}
+
+$('toExport').onclick = () => showTab(3);
+
+/* ------------------------------------------------------- step 3 */
+function ident() {
+  return ($('outName').value.trim().replace(/[^A-Za-z0-9_]/g, '_') || 'oled_anim');
+}
+function updateUsage() {
+  if (!rendered) return;
+  const n = ident(), up = n.toUpperCase();
+  const pages = $('layout').value === 'pages';
+  const body = pages
+    ? `        memcpy(fb, ${n}_frames[f], ${up}_BYTES);   // fb is uint8_t[PAGES][WIDTH]`
+    : `        blit_xbm(${n}_frames[f], ${up}_W, ${up}_H);`;
+  $('usage').textContent =
+`#include "${n}.h"
+
+static uint32_t last;
+static int      f;
+
+// call from the display loop on core 1
+if (to_ms_since_boot(get_absolute_time()) - last >= ${up}_FRAME_MS) {
+    last += ${up}_FRAME_MS;
+    f = (f + 1) % ${up}_FRAMES;
+${body}
+    sh1106_flush();
+}
+
+// ${rendered.frames} frames at ${playFps()} fps, ${rendered.bytesPerFrame} B each, ${(rendered.total/1024).toFixed(1)} KB in flash`;
+}
+['outName','layout'].forEach(id => $(id).oninput = updateUsage);
+$('layout').onchange = updateUsage;
+
+$('exportBtn').onclick = async () => {
+  if (!rendered) { msg('Extract and render frames first.', 'err'); return; }
+  $('exportBtn').disabled = true;
+  try {
+    const r = await post('/api/export', {
+      dir:$('outDir').value, name:ident(), layout:$('layout').value,
+      headerOnly:$('split').value === 'header', inFlash:$('inFlash').checked});
+    $('exportInfo').className = 'ok';
+    $('exportInfo').textContent =
+      `${r.frames} frames, ${(r.bytes/1024).toFixed(1)} KB, ${r.seconds.toFixed(2)} s`;
+    msg('Wrote ' + r.files.join('  +  '), 'ok');
+  } catch (e) { msg(e.message, 'err'); }
+  $('exportBtn').disabled = false;
+};
+
+$('resetTone').click();
+updateLen();
+</script>
+</body>
+</html>

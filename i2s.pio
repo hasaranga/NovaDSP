@@ -1,0 +1,123 @@
+; NovaDSP - 4-wire I2S (simultaneous TX and RX) for RP2350.
+;
+; Derived from the i2s.pio in grughuhler/rpi_pico_related (pico2_dsp_skeleton),
+; Copyright 2026 Grug Huhler, SPDX BSD-2-Clause.
+;
+; Changes from the original:
+;   * 4 PIO cycles per bit instead of 8, and SCK/MCLK is no longer generated
+;     here. MCLK comes from a hardware CLK_GPOUT pin instead (see audio.c).
+;     At 8 cycles/bit an exact 48 kHz needs a PIO divider of 12.5 - frequency
+;     exact but fractional, so the divider alternates between 12 and 13 cycles
+;     and smears ~3.3 ns of jitter onto every clock edge. At 4 cycles/bit the
+;     divider is exactly 25, and MCLK gets its own integer divide of 25 from
+;     the same clk_sys, which keeps MCLK:BCK locked at exactly 4:1.
+;   * side-set is 2 bits (BCK, LRCK) rather than 3.
+;   * the DOUT *pad* is not claimed here - see i2s_claim_dout() below.
+;
+; One state machine drives BCK and LRCK, shifts data out to the DAC and shifts
+; data in from the ADC. Because both directions live in the same state machine
+; they cannot drift apart - every frame clocked out is the frame clocked in.
+;
+; Framing: standard I2S, 24-bit data left-justified in 32-bit slots, MSB first,
+; 64 BCK per frame. LRCK changes during the final bit cell of the outgoing
+; channel, so the MSB of the next channel lands one BCK after the transition.
+;
+; PIO clock = 4 cycles/bit * 64 bits/frame * Fs = 256 * Fs.
+
+.program i2s
+.side_set 2
+
+; side-set bit 0 = BCK, bit 1 = LRCK
+
+.wrap_target
+public entry_point:
+; ---- Left channel: LRCK = 0, 32 bits ----
+left_loop:
+    out pins, 1         side 0b00   ; drive DOUT while BCK is low
+    nop                 side 0b00
+    in pins, 1          side 0b01   ; sample DIN on the BCK rising edge
+    jmp x-- left_loop   side 0b01
+
+    ; Final left bit. LRCK rises here so the right channel MSB follows one
+    ; BCK later, which is what makes this I2S rather than left-justified.
+    out pins, 1         side 0b10
+    nop                 side 0b10
+    in pins, 1          side 0b11
+    set x, 30           side 0b11   ; reload the bit counter for the right channel
+
+; ---- Right channel: LRCK = 1, 32 bits ----
+right_loop:
+    out pins, 1         side 0b10
+    nop                 side 0b10
+    in pins, 1          side 0b11
+    jmp x-- right_loop  side 0b11
+
+    ; Final right bit; LRCK falls for the next left channel.
+    out pins, 1         side 0b00
+    nop                 side 0b00
+    in pins, 1          side 0b01
+    set x, 30           side 0b01
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// clock_pin_base drives BCK; clock_pin_base + 1 drives LRCK (side-set requires
+// them to be consecutive GPIOs).
+static inline void i2s_program_init(PIO pio, uint sm, uint offset,
+                                    uint data_pin_out, uint data_pin_in,
+                                    uint clock_pin_base,
+                                    uint32_t div_int, uint8_t div_frac8) {
+    pio_sm_config c = i2s_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&c, data_pin_out, 1);
+    sm_config_set_in_pins(&c, data_pin_in);
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+
+    // MSB first (shift left), autopull/autopush at 32 bits.
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_in_shift(&c, false, true, 32);
+
+    // Separate 4-entry TX and RX FIFOs - this state machine needs both.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
+
+    sm_config_set_clkdiv_int_frac8(&c, div_int, div_frac8);
+
+    // The clocks and DIN are claimed here because they are the state
+    // machine's own: BCK and LRCK are what the ADC is slaved to, and DIN is
+    // where its samples arrive. **DOUT deliberately is not.** Which pin the
+    // processed block leaves on - and whether it leaves at all - is the output
+    // module's business, so the pad is claimed by whichever one is selected,
+    // through i2s_claim_dout() below. The shift register is still pointed at
+    // it by sm_config_set_out_pins() above, because that is state machine
+    // configuration rather than pin ownership.
+    pio_sm_set_consecutive_pindirs(pio, sm, clock_pin_base, 2, true);  // BCK, LRCK
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin_in, 1, false);    // DIN
+
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+    pio_gpio_init(pio, data_pin_in);
+
+    pio_sm_init(pio, sm, offset + i2s_offset_entry_point, &c);
+
+    // Prime the bit counter for the first (left) channel.
+    pio_sm_exec(pio, sm, pio_encode_set(pio_x, 30));
+}
+
+// Hand the DOUT pad to the state machine: function-select it to PIO and drive
+// it as an output.
+//
+// Split out of i2s_program_init() because **the DAC pin belongs to the output
+// module, not to the audio core.** The core configures the shift register to
+// shift towards this pin - it has to, the program does an `out pins, 1` - but
+// nothing here decides that a pin should be driven at all. That decision is
+// made by whichever output module the build selected, from its attach() hook.
+// See module.h and i2s_output_module/.
+//
+// Safe on a state machine that has not been enabled yet: both calls work
+// through pio_sm_exec, which does not need the clock running.
+static inline void i2s_claim_dout(PIO pio, uint sm, uint data_pin_out) {
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin_out, 1, true);
+    pio_gpio_init(pio, data_pin_out);
+}
+%}
