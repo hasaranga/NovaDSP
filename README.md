@@ -1,5 +1,7 @@
 # NovaDSP
 
+![NovaDSP](image/box.gif)
+
 Real-time audio DSP firmware for the **Raspberry Pi Pico 2 / RP2350**.
 
 48 kHz, 24-bit stereo in and out, with a graphic EQ, a BBE-style maximizer, a
@@ -71,9 +73,16 @@ the image runs from there, so leaving a module out buys real bytes.
 
 ## Hardware
 
+![board](image/IMG_3441.jpeg)
+![display](image/IMG_3440.jpeg)
+![adc](image/IMG_3442.jpeg)
+![dac](image/IMG_3446.jpeg)
+![optical](image/IMG_3439.jpeg)
+
+
 A Pico 2 (RP2350), a PCM1808 ADC module, a PCM5102A DAC module, an SH1106 or
 SSD1306 128x64 I2C OLED, and a rotary encoder with a push switch. The S/PDIF
-ends need only a TOSLINK transmitter and receiver.
+ends need only a TOSLINK transmitter and receiver (DLT1111A, DLR2180) connectors.
 
 ### Pin assignments
 
@@ -114,7 +123,7 @@ A and B are consecutive because the PIO quadrature decoder requires it.
 > are not 5 V tolerant**, and the encoder's pull-ups tie the inputs to whatever
 > rail the module is given.
 
-**S/PDIF**, if either end is selected.
+**S/PDIF Transmit/Receive Connectors (DLT1111A, DLR2180)**, if either end is selected.
 
 | Signal | GPIO | Build option |
 |---|---|---|
